@@ -1,5 +1,5 @@
-// 项目使用的C++版本：C++17
-// 编译要求：支持C++17标准的编译器
+// C++版本: C++17
+// 编译要求: 支持C++17标准的编译器
 #include <iostream>
 #include <vector>
 #include <string>
@@ -69,7 +69,7 @@ struct TestConfig {
         double multi_core = 2.0;
         double memory = 1000000.0;
         double crypto = 0.5;
-        double gpu = 1.0;
+        double gpu = 0.005;
     };
 
     struct Weights {
@@ -83,7 +83,7 @@ struct TestConfig {
     Weights weights;
     Benchmarks benchmarks;  // 基准值
     bool developer_mode = false;
-    const std::string version = "1.0.0 CLI";
+    const std::string version = "1.0.1 CLI";
 };
 
 // 全局配置和状态
@@ -109,6 +109,35 @@ void log(const std::string& message) {
     ss << "[" << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "] " << message;
     log_messages.push_back(ss.str());
     std::cout << ss.str() << std::endl;
+}
+
+// 获取用户名和计算机名
+std::string get_username() {
+    DWORD buffer_size = 0;
+    GetUserNameA(nullptr, &buffer_size);
+    if (buffer_size == 0) {
+        return "Unknown";
+    }
+
+    std::vector<char> buffer(buffer_size);
+    if (GetUserNameA(buffer.data(), &buffer_size)) {
+        return std::string(buffer.data());
+    }
+    return "Unknown";
+}
+
+std::string get_computername() {
+    DWORD buffer_size = 0;
+    GetComputerNameA(nullptr, &buffer_size);
+    if (buffer_size == 0) {
+        return "Unknown";
+    }
+
+    std::vector<char> buffer(buffer_size);
+    if (GetComputerNameA(buffer.data(), &buffer_size)) {
+        return std::string(buffer.data());
+    }
+    return "Unknown";
 }
 
 // 导出日志
@@ -2494,134 +2523,547 @@ void gpu_test() {
     log("开始GPU性能测试，持续 " + std::to_string(test_config.duration.gpu) + " 秒");
 
     auto start_time = std::chrono::high_resolution_clock::now();
+    auto end_time = start_time + std::chrono::seconds(test_config.duration.gpu);
 
-    // 使用unique_ptr确保资源自动释放
-    std::unique_ptr<DXComputeTester> dxTester = std::make_unique<DXComputeTester>();
+    // ========== 新增：添加超时保护 ==========
+    const auto max_test_time = std::chrono::seconds(30); // 最大30秒
+    auto hard_end_time = start_time + max_test_time;
+
+    // ========== 新增：快速硬件检测 ==========
     bool useHardware = false;
+    std::unique_ptr<DXComputeTester> dxTester;
 
-    try {
-        useHardware = dxTester->initialize();
-    }
-    catch (const std::exception& e) {
-        log("GPU初始化异常: " + std::string(e.what()));
-        useHardware = false;
-    }
-    catch (...) {
-        log("GPU初始化未知异常");
-        useHardware = false;
+    // 快速检测是否支持DirectX 11
+    {
+        ComPtr<ID3D11Device> testDevice;
+        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
+
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            featureLevels, 1, D3D11_SDK_VERSION, &testDevice, nullptr, nullptr);
+
+        if (SUCCEEDED(hr)) {
+            useHardware = true;
+            log("检测到DirectX 11硬件支持");
+        }
+        else {
+            log("未检测到DirectX 11硬件，将使用模拟测试");
+        }
     }
 
     double compute_tflops = 0.0, fft_tflops = 0.0, memory_gbs = 0.0;
+    int completed_tests = 0;
 
     if (useHardware) {
-        log("使用DirectX硬件加速进行GPU测试");
-
         try {
-            // GPU计算测试 - 使用更短的时间分配，避免长时间占用
-            int test_duration = std::max(1, test_config.duration.gpu / 4);
-
-            compute_tflops = dxTester->testMatrixMultiplicationTFLOPS(test_duration);
-            if (stop_test) {
-                // 立即释放GPU资源
+            dxTester = std::make_unique<DXComputeTester>();
+            if (!dxTester->initialize()) {
+                log("GPU初始化失败，回退到模拟测试");
+                useHardware = false;
                 dxTester.reset();
-                // 强制等待GPU资源释放
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                log("GPU测试被中止，资源已释放");
-                return;
             }
-
-            // 短暂等待，让GPU有机会释放资源
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // GPU FFT测试
-            fft_tflops = dxTester->testFFT_TFLOPS(test_duration);
-            if (stop_test) {
-                dxTester.reset();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                log("GPU测试被中止，资源已释放");
-                return;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // GPU内存带宽测试
-            memory_gbs = dxTester->testMemoryBandwidthGBs(test_duration);
-
-            // 测试完成后立即释放GPU资源
-            dxTester.reset();
-
-            // 强制等待确保GPU资源完全释放
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-            log("GPU资源已释放，占用率应恢复正常");
-
-        }
-        catch (const std::exception& e) {
-            log("GPU测试异常: " + std::string(e.what()));
-            dxTester.reset();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         catch (...) {
-            log("GPU测试未知异常");
-            dxTester.reset();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            log("GPU初始化异常，回退到模拟测试");
+            useHardware = false;
         }
     }
-    else {
-        log("无法初始化GPU硬件，跳过GPU测试");
-        // 模拟GPU测试结果
-        compute_tflops = 0.5 + random_double(0.0, 0.3);
-        fft_tflops = 0.3 + random_double(0.0, 0.2);
-        memory_gbs = 80.0 + random_double(0.0, 40.0);
-    }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+    // 优化测试流程
+    auto test_start = std::chrono::high_resolution_clock::now();
 
-    if (!stop_test) {
-        // 计算综合GPU得分
-        double normalized_score = 0.0;
+    // 计算每个子测试的时间分配（使用更短的测试时间）
+    const int total_duration = std::min(test_config.duration.gpu, 10); // 最多10秒
+    const int per_test_duration = std::max(1, total_duration / 3); // 每个测试最多3-4秒
 
-        if (useHardware) {
-            // 基于实际测试结果的评分
-            double compute_score = compute_tflops * 500.0;
-            double fft_score = fft_tflops * 300.0;
-            double memory_score = memory_gbs * 20.0;
+    log("GPU测试优化：总时间" + std::to_string(total_duration) + "秒，每项" +
+        std::to_string(per_test_duration) + "秒");
 
-            normalized_score = compute_score + fft_score + memory_score;
-            normalized_score = std::max(0.0, std::min(10000.0, normalized_score));
+    try {
+        if (useHardware && dxTester) {
+            // 矩阵乘法测试
+            if (!stop_test && std::chrono::high_resolution_clock::now() < hard_end_time) {
+                log("开始GPU矩阵乘法测试");
+                compute_tflops = dxTester->testMatrixMultiplicationTFLOPS(std::min(per_test_duration, 3));
+                if (compute_tflops > 0) completed_tests++;
+                log("矩阵乘法测试完成: " + std::to_string(compute_tflops) + " TFLOPS");
+            }
+
+            // 短暂暂停
+            if (!stop_test) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // FFT测试
+            if (!stop_test && std::chrono::high_resolution_clock::now() < hard_end_time) {
+                log("开始GPU FFT测试");
+                fft_tflops = dxTester->testFFT_TFLOPS(std::min(per_test_duration, 3));
+                if (fft_tflops > 0) completed_tests++;
+                log("FFT测试完成: " + std::to_string(fft_tflops) + " TFLOPS");
+            }
+
+            // 短暂暂停
+            if (!stop_test) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // 内存带宽测试
+            if (!stop_test && std::chrono::high_resolution_clock::now() < hard_end_time) {
+                log("开始GPU内存带宽测试（优化版）...");
+                memory_gbs = dxTester->testMemoryBandwidthGBs(std::min(per_test_duration, 2));
+                if (memory_gbs > 0) completed_tests++;
+                log("内存带宽测试完成: " + std::to_string(memory_gbs) + " GB/s");
+            }
+
+            // 立即释放GPU资源
+            dxTester.reset();
+
         }
         else {
-            // 软件模拟的评分
-            normalized_score = (compute_tflops * 500.0) + (fft_tflops * 300.0) + (memory_gbs * 20.0);
-            normalized_score = std::max(1000.0, std::min(5000.0, normalized_score));
+            // 优化4：轻量级模拟测试
+            log("使用GPU模拟测试...");
+
+            // 简化模拟测试，避免复杂计算
+            auto sim_start = std::chrono::high_resolution_clock::now();
+            int sim_iterations = 0;
+
+            while (!stop_test &&
+                std::chrono::high_resolution_clock::now() < sim_start + std::chrono::seconds(2) &&
+                std::chrono::high_resolution_clock::now() < hard_end_time) {
+
+                // 轻量级矩阵计算模拟
+                const int sim_size = 128;
+                std::vector<float> sim_data(sim_size * sim_size);
+                for (auto& val : sim_data) val = random_double();
+
+                // 简单计算（避免复杂矩阵乘法）
+                float sum = 0.0f;
+                for (int i = 0; i < 1000 && !stop_test; ++i) {
+                    sum += sim_data[i % sim_data.size()];
+                }
+
+                sim_iterations++;
+                if (sim_iterations % 10 == 0) {
+                    // 定期检查是否应该停止
+                    if (stop_test) break;
+                }
+            }
+
+            // 生成模拟结果（基于迭代次数）
+            double sim_factor = std::min(1.0, sim_iterations / 100.0);
+            compute_tflops = 0.5 + random_double(0.0, 0.5) * sim_factor;
+            fft_tflops = 0.3 + random_double(0.0, 0.3) * sim_factor;
+            memory_gbs = 50.0 + random_double(0.0, 30.0) * sim_factor;
+
+            completed_tests = 3; // 标记为完成所有测试
+            log("模拟测试完成: " + std::to_string(sim_iterations) + " 次迭代");
         }
+
+    }
+    catch (const std::exception& e) {
+        log("GPU测试异常: " + std::string(e.what()));
+        if (dxTester) dxTester.reset();
+    }
+    catch (...) {
+        log("GPU测试未知异常");
+        if (dxTester) dxTester.reset();
+    }
+
+    // 强制等待GPU资源释放
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto test_end = std::chrono::high_resolution_clock::now();
+    auto test_duration = std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start);
+
+    if (!stop_test) {
+        // 优化得分计算
+        double normalized_score = 0.0;
+
+        if (useHardware && completed_tests > 0) {
+            // 基于实际测试结果
+            normalized_score = (compute_tflops * 200.0 + fft_tflops * 150.0 + memory_gbs * 10.0) / completed_tests;
+        }
+        else if (completed_tests == 3) {
+            // 模拟测试结果
+            normalized_score = (compute_tflops * 200.0 + fft_tflops * 150.0 + memory_gbs * 10.0) / 3.0;
+        }
+        else {
+            // 测试失败或未完成
+            normalized_score = 1000.0; // 基准分
+        }
+
+        // 确保分数在合理范围内
+        normalized_score = std::max(500.0, std::min(10000.0, normalized_score));
 
         std::lock_guard<std::mutex> lock(result_mutex);
         raw_results["gpu"] = normalized_score;
         test_results["gpu"] = normalized_score;
 
+        // 输出信息
         log("\n----- GPU测试结果 -----");
         if (useHardware) {
-            log("矩阵计算性能: " + std::to_string(compute_tflops) + " TFLOPS");
-            log("FFT计算性能: " + std::to_string(fft_tflops) + " TFLOPS");
-            log("内存带宽: " + std::to_string(memory_gbs) + " GB/s");
+            log("硬件加速测试 (" + std::to_string(completed_tests) + "/3 项完成)");
+            if (compute_tflops > 0) log("矩阵计算: " + std::to_string(compute_tflops) + " TFLOPS");
+            if (fft_tflops > 0) log("FFT计算: " + std::to_string(fft_tflops) + " TFLOPS");
+            if (memory_gbs > 0) log("内存带宽: " + std::to_string(memory_gbs) + " GB/s");
         }
         else {
-            log("矩阵计算性能(模拟): " + std::to_string(compute_tflops) + " TFLOPS");
-            log("FFT计算性能(模拟): " + std::to_string(fft_tflops) + " TFLOPS");
+            log("模拟测试结果");
+            log("矩阵计算(模拟): " + std::to_string(compute_tflops) + " TFLOPS");
+            log("FFT计算(模拟): " + std::to_string(fft_tflops) + " TFLOPS");
             log("内存带宽(模拟): " + std::to_string(memory_gbs) + " GB/s");
         }
         log("综合得分: " + std::to_string(static_cast<int>(normalized_score)));
-        log("测试耗时: " + std::to_string(duration.count()) + " 秒");
+        log("测试耗时: " + std::to_string(test_duration.count() / 1000.0) + " 秒");
         log("GPU测试完成");
+
     }
     else {
-        log("GPU测试被中止");
-        // 确保资源被释放
-        dxTester.reset();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        log("GPU测试被用户中止");
+        if (dxTester) dxTester.reset();
     }
+}
+
+// 获取系统软硬件信息
+void get_info() {
+    log("开始获取系统软硬件信息...");
+
+    try {
+        // 操作系统信息
+        log("\n===== 操作系统信息 =====");
+
+        typedef LONG(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+        HMODULE hMod = GetModuleHandleW(L"ntdll.dll");
+        if (hMod) {
+            auto RtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
+            if (RtlGetVersion) {
+                RTL_OSVERSIONINFOW osVersionInfo = { 0 };
+                osVersionInfo.dwOSVersionInfoSize = sizeof(osVersionInfo);
+
+                if (RtlGetVersion(&osVersionInfo) == 0) {
+                    log("操作系统版本: " +
+                        std::to_string(osVersionInfo.dwMajorVersion) + "." +
+                        std::to_string(osVersionInfo.dwMinorVersion) + "." +
+                        std::to_string(osVersionInfo.dwBuildNumber));
+
+                    std::string osName;
+                    if (osVersionInfo.dwMajorVersion == 10) {
+                        osName = "Windows 10/11";
+                    }
+                    else if (osVersionInfo.dwMajorVersion == 6) {
+                        if (osVersionInfo.dwMinorVersion == 3) osName = "Windows 8.1";
+                        else if (osVersionInfo.dwMinorVersion == 2) osName = "Windows 8";
+                        else if (osVersionInfo.dwMinorVersion == 1) osName = "Windows 7";
+                        else if (osVersionInfo.dwMinorVersion == 0) osName = "Windows Vista";
+                    }
+                    else if (osVersionInfo.dwMajorVersion == 5) {
+                        osName = "Windows XP/Server 2003";
+                    }
+                    else {
+                        osName = "Windows 未知版本";
+                    }
+                    log("操作系统: " + osName);
+                }
+            }
+        }
+
+        // 检测系统架构
+        SYSTEM_INFO sysInfo;
+        GetNativeSystemInfo(&sysInfo);
+
+        std::string architecture;
+        switch (sysInfo.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64:
+            architecture = "64位 (x64)";
+            break;
+        case PROCESSOR_ARCHITECTURE_ARM:
+            architecture = "ARM";
+            break;
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            architecture = "ARM64";
+            break;
+        case PROCESSOR_ARCHITECTURE_INTEL:
+            architecture = "32位 (x86)";
+            break;
+        default:
+            architecture = "未知";
+        }
+        log("系统架构: " + architecture);
+
+        // CPU信息
+        log("\n===== CPU信息 =====");
+        log("逻辑处理器数量: " + std::to_string(sysInfo.dwNumberOfProcessors));
+
+        // 获取CPU品牌信息
+        int cpuInfo[4] = { 0 };
+        char cpuBrand[0x40] = { 0 };
+
+        __cpuid(cpuInfo, 0);
+        if (cpuInfo[0] >= 1) {
+            // 获取厂商
+            memset(cpuBrand, 0, sizeof(cpuBrand));
+            *((int*)cpuBrand) = cpuInfo[1];
+            *((int*)(cpuBrand + 4)) = cpuInfo[3];
+            *((int*)(cpuBrand + 8)) = cpuInfo[2];
+            log("CPU厂商: " + std::string(cpuBrand));
+
+            // 获取品牌字符串
+            __cpuid(cpuInfo, 0x80000000);
+            if ((unsigned)cpuInfo[0] >= 0x80000004) {
+                memset(cpuBrand, 0, sizeof(cpuBrand));
+
+                __cpuid(cpuInfo, 0x80000002);
+                memcpy(cpuBrand, cpuInfo, sizeof(cpuInfo));
+
+                __cpuid(cpuInfo, 0x80000003);
+                memcpy(cpuBrand + 16, cpuInfo, sizeof(cpuInfo));
+
+                __cpuid(cpuInfo, 0x80000004);
+                memcpy(cpuBrand + 32, cpuInfo, sizeof(cpuInfo));
+
+                // 清理品牌字符串中的多余空格
+                std::string cpuName = cpuBrand;
+                size_t start = cpuName.find_first_not_of(' ');
+                size_t end = cpuName.find_last_not_of(' ');
+                if (start != std::string::npos && end != std::string::npos) {
+                    cpuName = cpuName.substr(start, end - start + 1);
+                }
+                log("CPU型号: " + cpuName);
+            }
+        }
+
+        // 内存信息
+        log("\n===== 内存信息 =====");
+        MEMORYSTATUSEX memStatus;
+        memStatus.dwLength = sizeof(memStatus);
+
+        if (GlobalMemoryStatusEx(&memStatus)) {
+            double totalGB = static_cast<double>(memStatus.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
+            double availableGB = static_cast<double>(memStatus.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+            double usedPercent = static_cast<double>(memStatus.dwMemoryLoad);
+
+            log("物理内存总量: " + std::to_string(totalGB) + " GB");
+            log("可用物理内存: " + std::to_string(availableGB) + " GB");
+            log("内存使用率: " + std::to_string(usedPercent) + "%");
+        }
+
+        // 4. 磁盘信息 - 使用GetDiskFreeSpaceExW（支持大分区）
+        log("\n===== 磁盘信息 =====");
+        ULARGE_INTEGER freeBytes, totalBytes, totalFreeBytes;
+
+        std::vector<wchar_t> drives;
+        wchar_t driveStrings[256];
+        if (GetLogicalDriveStringsW(256, driveStrings)) {
+            for (wchar_t* drive = driveStrings; *drive; drive += wcslen(drive) + 1) {
+                UINT driveType = GetDriveTypeW(drive);
+                if (driveType == DRIVE_FIXED) { // 只显示固定磁盘
+                    if (GetDiskFreeSpaceExW(drive, &freeBytes, &totalBytes, &totalFreeBytes)) {
+                        double totalGB = static_cast<double>(totalBytes.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+                        double freeGB = static_cast<double>(freeBytes.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+                        double usedGB = totalGB - freeGB;
+                        double usedPercent = (usedGB / totalGB) * 100.0;
+
+                        // 转换驱动器名称为ASCII
+                        char driveLetter[10];
+                        WideCharToMultiByte(CP_UTF8, 0, drive, -1, driveLetter, sizeof(driveLetter), NULL, NULL);
+
+                        log(std::string(driveLetter) + "盘 - 总容量: " +
+                            std::to_string(totalGB) + " GB, 已使用: " +
+                            std::to_string(usedGB) + " GB (" +
+                            std::to_string(usedPercent) + "%), 可用: " +
+                            std::to_string(freeGB) + " GB");
+                    }
+                }
+            }
+        }
+
+        // 显示适配器信息
+        log("\n===== 显示适配器信息 =====");
+
+        // 首先尝试使用DirectX获取GPU信息
+        IDXGIFactory* pFactory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&pFactory))) {
+            IDXGIAdapter* pAdapter = nullptr;
+
+            for (UINT i = 0; pFactory->EnumAdapters(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+                DXGI_ADAPTER_DESC desc;
+                if (SUCCEEDED(pAdapter->GetDesc(&desc))) {
+                    char adapterName[256];
+                    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, adapterName, sizeof(adapterName), NULL, NULL);
+
+                    std::string gpuType = (i == 0) ? "主显示适配器" : "副显示适配器";
+                    log(gpuType + ": " + std::string(adapterName));
+
+                    // 显示显存信息
+                    double videoMemoryGB = static_cast<double>(desc.DedicatedVideoMemory) / (1024.0 * 1024.0 * 1024.0);
+                    double sharedMemoryGB = static_cast<double>(desc.SharedSystemMemory) / (1024.0 * 1024.0 * 1024.0);
+
+                    log("  专用显存: " + std::to_string(videoMemoryGB) + " GB");
+                    log("  共享内存: " + std::to_string(sharedMemoryGB) + " GB");
+                }
+                pAdapter->Release();
+            }
+            pFactory->Release();
+        }
+        else {
+            // 备选方案：使用EnumDisplayDevices
+            DISPLAY_DEVICEA displayDevice = { 0 };
+            displayDevice.cb = sizeof(displayDevice);
+
+            for (int i = 0; EnumDisplayDevicesA(NULL, i, &displayDevice, 0); i++) {
+                if (displayDevice.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) {
+                    log("主显示适配器: " + std::string(displayDevice.DeviceString));
+                    break;
+                }
+            }
+        }
+
+        // 屏幕分辨率
+        log("\n===== 显示设置 =====");
+        int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        log("主显示器分辨率: " + std::to_string(screenWidth) + " × " + std::to_string(screenHeight));
+
+        // 获取所有显示器
+        int monitorCount = GetSystemMetrics(SM_CMONITORS);
+        log("显示器数量: " + std::to_string(monitorCount));
+
+        // 系统环境信息
+        log("\n===== 系统环境信息 =====");
+
+        char systemDir[MAX_PATH];
+        if (GetSystemDirectoryA(systemDir, MAX_PATH)) {
+            log("系统目录: " + std::string(systemDir));
+        }
+
+        char windowsDir[MAX_PATH];
+        if (GetWindowsDirectoryA(windowsDir, MAX_PATH)) {
+            log("Windows目录: " + std::string(windowsDir));
+        }
+
+        char tempDir[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, tempDir)) {
+            log("临时目录: " + std::string(tempDir));
+        }
+
+        // 时区信息
+        DYNAMIC_TIME_ZONE_INFORMATION tzInfo;
+        if (GetDynamicTimeZoneInformation(&tzInfo) != TIME_ZONE_ID_INVALID) {
+            char timeZoneName[256];
+            WideCharToMultiByte(CP_UTF8, 0, tzInfo.TimeZoneKeyName, -1, timeZoneName, sizeof(timeZoneName), NULL, NULL);
+            log("时区: " + std::string(timeZoneName));
+        }
+
+        // 系统语言
+        LANGID langId = GetUserDefaultUILanguage();
+        char langName[256];
+        if (GetLocaleInfoA(MAKELCID(langId, SORT_DEFAULT), LOCALE_SENGLANGUAGE, langName, 256)) {
+            log("系统语言: " + std::string(langName));
+        }
+
+        // 计算机名和用户名
+        log("计算机名: " + get_computername());
+        log("用户名: " + get_username());
+
+        // 系统运行时间
+        log("\n===== 系统运行状态 =====");
+        ULONGLONG tickCount = GetTickCount64();
+        int days = tickCount / (1000 * 60 * 60 * 24);
+        int hours = (tickCount % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60);
+        int minutes = (tickCount % (1000 * 60 * 60)) / (1000 * 60);
+        int seconds = (tickCount % (1000 * 60)) / 1000;
+
+        log("系统已运行: " + std::to_string(days) + "天 " +
+            std::to_string(hours) + "小时 " +
+            std::to_string(minutes) + "分钟 " +
+            std::to_string(seconds) + "秒");
+
+        // 进程信息
+        log("当前进程ID: " + std::to_string(GetCurrentProcessId()));
+        log("当前线程ID: " + std::to_string(GetCurrentThreadId()));
+
+        // 获取系统版本详细信息
+        log("\n===== 系统详细信息 =====");
+
+        // 使用WMI替代方案：通过注册表获取Windows版本
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+
+            char productName[256];
+            DWORD size = sizeof(productName);
+
+            if (RegQueryValueExA(hKey, "ProductName", NULL, NULL,
+                (LPBYTE)productName, &size) == ERROR_SUCCESS) {
+                log("产品名称: " + std::string(productName));
+            }
+
+            char displayVersion[256];
+            size = sizeof(displayVersion);
+            if (RegQueryValueExA(hKey, "DisplayVersion", NULL, NULL,
+                (LPBYTE)displayVersion, &size) == ERROR_SUCCESS) {
+                log("显示版本: " + std::string(displayVersion));
+            }
+
+            char buildLabEx[256];
+            size = sizeof(buildLabEx);
+            if (RegQueryValueExA(hKey, "BuildLabEx", NULL, NULL,
+                (LPBYTE)buildLabEx, &size) == ERROR_SUCCESS) {
+                log("构建版本: " + std::string(buildLabEx));
+            }
+
+            RegCloseKey(hKey);
+        }
+
+        // 获取BIOS信息
+        log("\n===== BIOS信息 =====");
+        HKEY biosKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS",
+            0, KEY_READ, &biosKey) == ERROR_SUCCESS) {
+
+            char biosVendor[256];
+            DWORD size = sizeof(biosVendor);
+
+            if (RegQueryValueExA(biosKey, "BIOSVendor", NULL, NULL,
+                (LPBYTE)biosVendor, &size) == ERROR_SUCCESS) {
+                log("BIOS厂商: " + std::string(biosVendor));
+            }
+
+            char biosVersion[256];
+            size = sizeof(biosVersion);
+            if (RegQueryValueExA(biosKey, "BIOSVersion", NULL, NULL,
+                (LPBYTE)biosVersion, &size) == ERROR_SUCCESS) {
+                log("BIOS版本: " + std::string(biosVersion));
+            }
+
+            char biosReleaseDate[256];
+            size = sizeof(biosReleaseDate);
+            if (RegQueryValueExA(biosKey, "BIOSReleaseDate", NULL, NULL,
+                (LPBYTE)biosReleaseDate, &size) == ERROR_SUCCESS) {
+                log("BIOS发布日期: " + std::string(biosReleaseDate));
+            }
+
+            RegCloseKey(biosKey);
+        }
+
+        log("\n软硬件信息获取完成");
+
+    }
+    catch (const std::exception& e) {
+        log("获取信息时发生错误: " + std::string(e.what()));
+    }
+    catch (...) {
+        log("获取信息时发生未知错误");
+    }
+}
+
+void gpu_test_it_s_too_difficult() {
+    log("GPU实现太难了，虽然我们也在尽力优化，但是结果还是不准确");
+    log("我觉得我们还是关闭GPU测试吧？");
+}
+
+void update_log() {
+    log("1.0.1 CLI更新日志");
+    log("优化GPU测试，使带宽获取更准确，测试时间更短（相对）");
+    log("增加获取系统信息的函数（void get_info）");
 }
 
 // 执行所有测试（使用标准化得分计算）
@@ -2797,6 +3239,9 @@ void show_help() {
     log("- 测试项=true/false: 开启/关闭指定测试项");
     log("- dev-test: 开启/关闭开发者模式");
     log("- ver: 显示软件版本");
+    log("- get-info: 获取系统软硬件信息");
+    log("- update-log: 查看版本更新日志");
+    log("- difficult: 说不定有什么隐藏彩蛋或者开发者的诉苦？");
 }
 
 // 列出所有测试项
@@ -2812,9 +3257,6 @@ void list_tests() {
         "秒, 状态: " + (test_config.switches.crypto ? "开启" : "关闭") + ")");
     log("- gpu: GPGPU性能测试 (时长: " + std::to_string(test_config.duration.gpu) +
         "秒, 状态: " + (test_config.switches.gpu ? "开启" : "关闭") + ")");
-    log("\n设置开关语法: 测试项=true 或 测试项=false");
-    log("例如: single_core=false (关闭单核测试)");
-    log("      gpu=true (开启GPU测试)");
 }
 
 // 设置测试时间
@@ -2892,8 +3334,8 @@ void toggle_developer_mode() {
 // 显示版本信息
 void show_version() {
     log("Arce TestTool 版本 " + test_config.version);
-	log("版权所有 (c) 一名飞手。");
-	log("Copyright (c) yimingfeishou.");
+    log("版权所有 (c) 一名飞手。");
+    log("Copyright (c) yimingfeishou.");
 }
 
 // 解析并执行命令
@@ -2930,6 +3372,15 @@ void execute_command(const std::string& command) {
     }
     else if (command == "test-time-re") {
         restore_default_time();
+    }
+    else if (command == "get-info") {
+        get_info();
+    }
+    else if (command == "update-log") {
+        update_log();
+    }
+    else if (command == "difficult") {
+        gpu_test_it_s_too_difficult();
     }
     else if (command.substr(0, 10) == "test-time-") {
         std::string sub = command.substr(10);
@@ -2992,35 +3443,6 @@ void execute_command(const std::string& command) {
     }
 }
 
-// 获取用户名和计算机名
-std::string get_username() {
-    DWORD buffer_size = 0;
-    GetUserNameA(nullptr, &buffer_size);
-    if (buffer_size == 0) {
-        return "Unknown";
-    }
-
-    std::vector<char> buffer(buffer_size);
-    if (GetUserNameA(buffer.data(), &buffer_size)) {
-        return std::string(buffer.data());
-    }
-    return "Unknown";
-}
-
-std::string get_computername() {
-    DWORD buffer_size = 0;
-    GetComputerNameA(nullptr, &buffer_size);
-    if (buffer_size == 0) {
-        return "Unknown";
-    }
-
-    std::vector<char> buffer(buffer_size);
-    if (GetComputerNameA(buffer.data(), &buffer_size)) {
-        return std::string(buffer.data());
-    }
-    return "Unknown";
-}
-
 int main() {
     std::string username = get_username();
     std::string computername = get_computername();
@@ -3033,7 +3455,7 @@ int main() {
     log("如要获得最准确的测试结果，建议以管理员身份运行");
     log("L1/L2为获取单个核心的缓存，L3为获取整个CPU的缓存，可能会与任务管理器显示的缓存有差异");
     log("测试结果仅供参考，请以实际性能为准");
-    log("GPU测试时间可能较长（屎山代码发力了），将在后续更新时解决，敬请谅解，可以关闭此测试项，指令详见 'help'");
+    log("GPU测试时间可能较长（屎山代码发力了），将在后续更新时解决（现在没解决），敬请谅解，可以关闭此测试项，指令详见 'help'");
     log("在 " + username + " 用户上");
     log("在 " + computername + " 计算机上\n");
 
