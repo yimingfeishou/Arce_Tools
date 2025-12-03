@@ -2672,25 +2672,12 @@ void gpu_test() {
     auto test_duration = std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start);
 
     if (!stop_test) {
-        // 计算原始得分（基于性能指标的加权和）
-        double raw_score = 0.0;
+        // 计算原始得分（简单的加权和，保持与其他测试项一致）
+        double raw_score = (compute_tflops + fft_tflops + memory_gbs) / 3.0;
 
-        if (useHardware) {
-            // 基于实际测试结果的评分权重
-            raw_score = (compute_tflops * 500.0) +  // 矩阵计算权重
-                (fft_tflops * 300.0) +       // FFT计算权重
-                (memory_gbs * 20.0);         // 内存带宽权重
-        }
-        else {
-            // 软件模拟的评分（权重可调整）
-            raw_score = (compute_tflops * 200.0) +
-                (fft_tflops * 150.0) +
-                (memory_gbs * 15.0);
-        }
-
-        // 标准化得分 = (原始得分 / 基准值) * 100
+        // 使用配置中的基准值进行标准化
         double normalized = (raw_score / test_config.benchmarks.gpu) * 100;
-        normalized = std::max(0.0, normalized); // 只确保非负，不设上限
+        normalized = std::max(0.0, normalized); // 只确保非负
 
         std::lock_guard<std::mutex> lock(result_mutex);
         raw_results["gpu"] = raw_score;
