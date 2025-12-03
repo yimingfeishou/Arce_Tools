@@ -69,7 +69,7 @@ struct TestConfig {
         double multi_core = 2.0;
         double memory = 1000000.0;
         double crypto = 0.5;
-        double gpu = 0.005;
+        double gpu = 1.0;
     };
 
     struct Weights {
@@ -2605,7 +2605,7 @@ void gpu_test() {
 
             // 内存带宽测试
             if (!stop_test && std::chrono::high_resolution_clock::now() < hard_end_time) {
-                log("开始GPU内存带宽测试（优化版）...");
+                log("开始GPU内存带宽测试...");
                 memory_gbs = dxTester->testMemoryBandwidthGBs(std::min(per_test_duration, 2));
                 if (memory_gbs > 0) completed_tests++;
                 log("内存带宽测试完成: " + std::to_string(memory_gbs) + " GB/s");
@@ -2672,51 +2672,49 @@ void gpu_test() {
     auto test_duration = std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start);
 
     if (!stop_test) {
-        // 优化得分计算
-        double normalized_score = 0.0;
+        // 计算原始得分（基于性能指标的加权和）
+        double raw_score = 0.0;
 
-        if (useHardware && completed_tests > 0) {
-            // 基于实际测试结果
-            normalized_score = (compute_tflops * 200.0 + fft_tflops * 150.0 + memory_gbs * 10.0) / completed_tests;
-        }
-        else if (completed_tests == 3) {
-            // 模拟测试结果
-            normalized_score = (compute_tflops * 200.0 + fft_tflops * 150.0 + memory_gbs * 10.0) / 3.0;
+        if (useHardware) {
+            // 基于实际测试结果的评分权重
+            raw_score = (compute_tflops * 500.0) +  // 矩阵计算权重
+                (fft_tflops * 300.0) +       // FFT计算权重
+                (memory_gbs * 20.0);         // 内存带宽权重
         }
         else {
-            // 测试失败或未完成
-            normalized_score = 1000.0; // 基准分
+            // 软件模拟的评分（权重可调整）
+            raw_score = (compute_tflops * 200.0) +
+                (fft_tflops * 150.0) +
+                (memory_gbs * 15.0);
         }
 
-        // 确保分数在合理范围内
-        normalized_score = std::max(500.0, std::min(10000.0, normalized_score));
+        // 标准化得分 = (原始得分 / 基准值) * 100
+        double normalized = (raw_score / test_config.benchmarks.gpu) * 100;
+        normalized = std::max(0.0, normalized); // 只确保非负，不设上限
 
         std::lock_guard<std::mutex> lock(result_mutex);
-        raw_results["gpu"] = normalized_score;
-        test_results["gpu"] = normalized_score;
+        raw_results["gpu"] = raw_score;
+        test_results["gpu"] = normalized;
 
         // 输出信息
-        log("\n----- GPU测试结果 -----");
+        log("GPGPU性能测试完成");
         if (useHardware) {
-            log("硬件加速测试 (" + std::to_string(completed_tests) + "/3 项完成)");
-            if (compute_tflops > 0) log("矩阵计算: " + std::to_string(compute_tflops) + " TFLOPS");
-            if (fft_tflops > 0) log("FFT计算: " + std::to_string(fft_tflops) + " TFLOPS");
-            if (memory_gbs > 0) log("内存带宽: " + std::to_string(memory_gbs) + " GB/s");
+            log("矩阵计算性能: " + std::to_string(compute_tflops) + " TFLOPS");
+            log("FFT计算性能: " + std::to_string(fft_tflops) + " TFLOPS");
+            log("内存带宽: " + std::to_string(memory_gbs) + " GB/s");
         }
         else {
-            log("模拟测试结果");
-            log("矩阵计算(模拟): " + std::to_string(compute_tflops) + " TFLOPS");
-            log("FFT计算(模拟): " + std::to_string(fft_tflops) + " TFLOPS");
+            log("矩阵计算性能(模拟): " + std::to_string(compute_tflops) + " TFLOPS");
+            log("FFT计算性能(模拟): " + std::to_string(fft_tflops) + " TFLOPS");
             log("内存带宽(模拟): " + std::to_string(memory_gbs) + " GB/s");
         }
-        log("综合得分: " + std::to_string(static_cast<int>(normalized_score)));
-        log("测试耗时: " + std::to_string(test_duration.count() / 1000.0) + " 秒");
-        log("GPU测试完成");
+        log("原始: " + std::to_string(raw_score) +
+            ", 标准化: " + std::to_string(normalized));
 
     }
     else {
-        log("GPU测试被用户中止");
-        if (dxTester) dxTester.reset();
+        log("GPU测试被中止");
+        dxTester.reset();
     }
 }
 
@@ -2843,7 +2841,7 @@ void get_info() {
             log("内存使用率: " + std::to_string(usedPercent) + "%");
         }
 
-        // 4. 磁盘信息 - 使用GetDiskFreeSpaceExW（支持大分区）
+        // 磁盘信息
         log("\n===== 磁盘信息 =====");
         ULARGE_INTEGER freeBytes, totalBytes, totalFreeBytes;
 
