@@ -2672,12 +2672,12 @@ void gpu_test() {
     auto test_duration = std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start);
 
     if (!stop_test) {
-        // 计算原始得分（简单的加权和，保持与其他测试项一致）
+        // 计算原始得分
         double raw_score = (compute_tflops + fft_tflops + memory_gbs) / 3.0;
 
         // 使用配置中的基准值进行标准化
         double normalized = (raw_score / test_config.benchmarks.gpu) * 100;
-        normalized = std::max(0.0, normalized); // 只确保非负
+        normalized = std::max(0.0, normalized); // 确保非负
 
         std::lock_guard<std::mutex> lock(result_mutex);
         raw_results["gpu"] = raw_score;
