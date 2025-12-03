@@ -1,3 +1,5 @@
+// 项目使用的C++版本：C++17
+// 编译要求：支持C++17标准的编译器
 #include <iostream>
 #include <vector>
 #include <string>
