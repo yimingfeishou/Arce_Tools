@@ -83,7 +83,7 @@ struct TestConfig {
     Weights weights;
     Benchmarks benchmarks;  // 基准值
     bool developer_mode = false;
-    const std::string version = "1.0.1 CLI";
+    const std::string version = "1.0.2 CLI";
 };
 
 // 全局配置和状态
@@ -2713,8 +2713,14 @@ void get_info() {
         // 操作系统信息
         log("\n===== 操作系统信息 =====");
 
+        // RtlGetVersion
         typedef LONG(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
         HMODULE hMod = GetModuleHandleW(L"ntdll.dll");
+
+        std::string osName = "Windows 未知版本";
+        DWORD majorVersion = 0, minorVersion = 0, buildNumber = 0;
+        std::string displayVersion = "未知";
+
         if (hMod) {
             auto RtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
             if (RtlGetVersion) {
@@ -2722,33 +2728,132 @@ void get_info() {
                 osVersionInfo.dwOSVersionInfoSize = sizeof(osVersionInfo);
 
                 if (RtlGetVersion(&osVersionInfo) == 0) {
-                    log("操作系统版本: " +
-                        std::to_string(osVersionInfo.dwMajorVersion) + "." +
-                        std::to_string(osVersionInfo.dwMinorVersion) + "." +
-                        std::to_string(osVersionInfo.dwBuildNumber));
+                    majorVersion = osVersionInfo.dwMajorVersion;
+                    minorVersion = osVersionInfo.dwMinorVersion;
+                    buildNumber = osVersionInfo.dwBuildNumber;
 
-                    std::string osName;
-                    if (osVersionInfo.dwMajorVersion == 10) {
-                        osName = "Windows 10/11";
+                    // 根据版本号判断操作系统
+                    if (majorVersion == 10 && minorVersion == 0) {
+                        // Windows 10 或 Windows 11
+                        if (buildNumber >= 22000) {
+                            osName = "Windows 11";
+                        }
+                        else {
+                            osName = "Windows 10";
+                        }
                     }
-                    else if (osVersionInfo.dwMajorVersion == 6) {
-                        if (osVersionInfo.dwMinorVersion == 3) osName = "Windows 8.1";
-                        else if (osVersionInfo.dwMinorVersion == 2) osName = "Windows 8";
-                        else if (osVersionInfo.dwMinorVersion == 1) osName = "Windows 7";
-                        else if (osVersionInfo.dwMinorVersion == 0) osName = "Windows Vista";
+                    else if (majorVersion == 6) {
+                        if (minorVersion == 3) osName = "Windows 8.1";
+                        else if (minorVersion == 2) osName = "Windows 8";
+                        else if (minorVersion == 1) osName = "Windows 7";
+                        else if (minorVersion == 0) osName = "Windows Vista";
                     }
-                    else if (osVersionInfo.dwMajorVersion == 5) {
+                    else if (majorVersion == 5) {
                         osName = "Windows XP/Server 2003";
                     }
-                    else {
-                        osName = "Windows 未知版本";
-                    }
-                    log("操作系统: " + osName);
                 }
             }
         }
 
-        // 检测系统架构
+        // 获取显示版本和更多详细信息
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+
+            // 获取产品名称
+            char productName[256] = { 0 };
+            DWORD size = sizeof(productName);
+            if (RegQueryValueExA(hKey, "ProductName", NULL, NULL,
+                (LPBYTE)productName, &size) == ERROR_SUCCESS) {
+                // 从产品名称中提取更准确的信息
+                std::string productStr = productName;
+                if (productStr.find("Windows 11") != std::string::npos) {
+                    osName = "Windows 11";
+                }
+                else if (productStr.find("Windows 10") != std::string::npos) {
+                    osName = "Windows 10";
+                }
+            }
+
+            // 获取显示版本
+            char displayVersionStr[256] = { 0 };
+            size = sizeof(displayVersionStr);
+            if (RegQueryValueExA(hKey, "DisplayVersion", NULL, NULL,
+                (LPBYTE)displayVersionStr, &size) == ERROR_SUCCESS) {
+                displayVersion = displayVersionStr;
+            }
+            // 如果没有 DisplayVersion，尝试获取 ReleaseId
+            else {
+                char releaseId[256] = { 0 };
+                size = sizeof(releaseId);
+                if (RegQueryValueExA(hKey, "ReleaseId", NULL, NULL,
+                    (LPBYTE)releaseId, &size) == ERROR_SUCCESS) {
+                    displayVersion = releaseId;
+                }
+            }
+
+            // 获取 UBR用于更精确的构建号
+            DWORD ubr = 0;
+            size = sizeof(ubr);
+            if (RegQueryValueExA(hKey, "UBR", NULL, NULL,
+                (LPBYTE)&ubr, &size) == ERROR_SUCCESS && ubr > 0) {
+                buildNumber = (buildNumber * 10000) + ubr; // 组合成完整构建号
+            }
+
+            RegCloseKey(hKey);
+        }
+
+        // 尝试使用新的 Win11 API 检测 Windows 11 特定功能
+        bool isWindows11 = false;
+        if (buildNumber >= 22000) {
+            isWindows11 = true;
+            osName = "Windows 11";
+
+            // 检查是否启用了 Windows 11 的圆角窗口特性
+            HKEY hKeyWin11;
+            if (RegOpenKeyExA(HKEY_CURRENT_USER,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+                0, KEY_READ, &hKeyWin11) == ERROR_SUCCESS) {
+
+                DWORD useRoundedCorners = 0;
+                DWORD size = sizeof(useRoundedCorners);
+                if (RegQueryValueExA(hKeyWin11, "UseRoundedCorners", NULL, NULL,
+                    (LPBYTE)&useRoundedCorners, &size) == ERROR_SUCCESS) {
+                    // 如果这个键存在，基本可以确认是 Windows 11
+                    isWindows11 = true;
+                }
+                RegCloseKey(hKeyWin11);
+            }
+        }
+
+        // 输出操作系统信息
+        log("操作系统: " + osName);
+        log("显示版本: " + displayVersion);
+        log("版本: " + std::to_string(majorVersion) + "." +
+            std::to_string(minorVersion) + "." +
+            std::to_string(buildNumber));
+
+        // 额外显示 Windows 11 特定信息
+        if (isWindows11) {
+
+            // 尝试获取 Windows 11 功能更新版本
+            HKEY hKeyWin11Features;
+            if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings",
+                0, KEY_READ, &hKeyWin11Features) == ERROR_SUCCESS) {
+
+                DWORD featureUpdateVersion = 0;
+                DWORD size = sizeof(featureUpdateVersion);
+                if (RegQueryValueExA(hKeyWin11Features, "UxOption", NULL, NULL,
+                    (LPBYTE)&featureUpdateVersion, &size) == ERROR_SUCCESS) {
+                    log("Windows 11 功能更新版本: " + std::to_string(featureUpdateVersion));
+                }
+                RegCloseKey(hKeyWin11Features);
+            }
+        }
+
+        // 系统架构
         SYSTEM_INFO sysInfo;
         GetNativeSystemInfo(&sysInfo);
 
@@ -2967,24 +3072,16 @@ void get_info() {
         log("\n===== 系统详细信息 =====");
 
         // 使用WMI替代方案：通过注册表获取Windows版本
-        HKEY hKey;
         if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
             "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
 
-            char productName[256];
+            char productName[256] = { 0 };
             DWORD size = sizeof(productName);
 
             if (RegQueryValueExA(hKey, "ProductName", NULL, NULL,
                 (LPBYTE)productName, &size) == ERROR_SUCCESS) {
                 log("产品名称: " + std::string(productName));
-            }
-
-            char displayVersion[256];
-            size = sizeof(displayVersion);
-            if (RegQueryValueExA(hKey, "DisplayVersion", NULL, NULL,
-                (LPBYTE)displayVersion, &size) == ERROR_SUCCESS) {
-                log("显示版本: " + std::string(displayVersion));
             }
 
             char buildLabEx[256];
@@ -3043,12 +3140,15 @@ void get_info() {
 void gpu_test_it_s_too_difficult() {
     log("GPU实现太难了，虽然我们也在尽力优化，但是结果还是不准确");
     log("我觉得我们还是关闭GPU测试吧？");
+    log("为什么微软不在更新Windows 11的时候同步更新API啊，搞得现在获取ProductName都不准确");
 }
 
 void update_log() {
-    log("1.0.1 CLI更新日志");
+    log("1.0.1 CLI更新日志 [更新日期: 2025年12月4日]");
     log("优化GPU测试，使带宽获取更准确，测试时间更短（相对）");
     log("增加获取系统信息的函数（void get_info）");
+    log("1.0.2 CLI更新日志 [更新日期: 2025年12月6日]");
+    log("优化获取系统信息的函数（void get_info），区分Windows 10和Windows 11");
 }
 
 // 执行所有测试（使用标准化得分计算）
