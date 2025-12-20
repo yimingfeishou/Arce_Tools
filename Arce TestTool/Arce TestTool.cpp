@@ -83,7 +83,7 @@ struct TestConfig {
     Weights weights;
     Benchmarks benchmarks;  // 基准值
     bool developer_mode = false;
-    const std::string version = "1.0.2 CLI";
+    const std::string version = "1.0.3 CLI";
 };
 
 // 全局配置和状态
@@ -198,6 +198,251 @@ bool export_log(const std::string& path) {
 
     log("日志已导出至: " + target.string());
     return true;
+}
+
+// 导入配置文件
+bool load_ini_file(const std::string& filepath) {
+    log("尝试加载配置文件: " + filepath);
+
+    // 检查文件扩展名
+    if (filepath.length() < 4 ||
+        (filepath.substr(filepath.length() - 4) != ".ini" &&
+            filepath.substr(filepath.length() - 4) != ".INI")) {
+        log("错误：文件扩展名不匹配，请使用.ini格式");
+        return false;
+    }
+
+    std::ifstream file(filepath, std::ios::in);
+    if (!file.is_open()) {
+        log("错误：无法打开配置文件，请检查路径和权限");
+        return false;
+    }
+
+    try {
+        std::string line;
+        std::string current_section;
+
+        // 读取BOM判断UTF-8
+        char bom[3];
+        file.read(bom, 3);
+        if (bom[0] == (char)0xEF && bom[1] == (char)0xBB && bom[2] == (char)0xBF) {
+            log("检测到UTF-8 BOM");
+        }
+        else {
+            // 不是UTF-8 BOM，重置文件指针
+            file.seekg(0, std::ios::beg);
+        }
+
+        while (std::getline(file, line)) {
+            // 去除空白字符
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+            // 跳过空行和注释
+            if (line.empty() || line[0] == ';' || line[0] == '#') {
+                continue;
+            }
+
+            // 处理节
+            if (line[0] == '[' && line.back() == ']') {
+                current_section = line.substr(1, line.length() - 2);
+                continue;
+            }
+
+            // 解析键值对
+            size_t equal_pos = line.find('=');
+            if (equal_pos != std::string::npos) {
+                std::string key = line.substr(0, equal_pos);
+                std::string value = line.substr(equal_pos + 1);
+
+                // 去除键值两边的空白
+                key.erase(0, key.find_first_not_of(" \t"));
+                key.erase(key.find_last_not_of(" \t") + 1);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+
+                // 根据节和键更新配置
+                if (current_section == "Durations") {
+                    try {
+                        int int_value = std::stoi(value);
+                        if (key == "single_core") test_config.duration.single_core = int_value;
+                        else if (key == "multi_core") test_config.duration.multi_core = int_value;
+                        else if (key == "memory") test_config.duration.memory = int_value;
+                        else if (key == "crypto") test_config.duration.crypto = int_value;
+                        else if (key == "gpu") test_config.duration.gpu = int_value;
+                    }
+                    catch (...) {
+                        log("警告: 无法解析整数值: " + key + " = " + value);
+                    }
+                }
+                else if (current_section == "Switches") {
+                    try {
+                        bool bool_value = (value == "1" || value == "true" || value == "True" || value == "TRUE");
+                        if (key == "single_core") test_config.switches.single_core = bool_value;
+                        else if (key == "multi_core") test_config.switches.multi_core = bool_value;
+                        else if (key == "memory") test_config.switches.memory = bool_value;
+                        else if (key == "crypto") test_config.switches.crypto = bool_value;
+                        else if (key == "gpu") test_config.switches.gpu = bool_value;
+                    }
+                    catch (...) {
+                        log("警告: 无法解析布尔值: " + key + " = " + value);
+                    }
+                }
+                else if (current_section == "Weights") {
+                    try {
+                        double double_value = std::stod(value);
+                        if (key == "single_core") test_config.weights.single_core = double_value;
+                        else if (key == "multi_core") test_config.weights.multi_core = double_value;
+                        else if (key == "memory") test_config.weights.memory = double_value;
+                        else if (key == "crypto") test_config.weights.crypto = double_value;
+                        else if (key == "gpu") test_config.weights.gpu = double_value;
+                    }
+                    catch (...) {
+                        log("警告: 无法解析浮点数值: " + key + " = " + value);
+                    }
+                }
+                else if (current_section == "Benchmarks") {
+                    try {
+                        double double_value = std::stod(value);
+                        if (key == "single_core") test_config.benchmarks.single_core = double_value;
+                        else if (key == "multi_core") test_config.benchmarks.multi_core = double_value;
+                        else if (key == "memory") test_config.benchmarks.memory = double_value;
+                        else if (key == "crypto") test_config.benchmarks.crypto = double_value;
+                        else if (key == "gpu") test_config.benchmarks.gpu = double_value;
+                    }
+                    catch (...) {
+                        log("警告: 无法解析浮点数值: " + key + " = " + value);
+                    }
+                }
+                else if (current_section == "Other") {
+                    if (key == "developer_mode") {
+                        test_config.developer_mode = (value == "1" || value == "true" || value == "True" || value == "TRUE");
+                    }
+                }
+            }
+        }
+
+        file.close();
+        log("导入完成");
+        log("已更新配置：");
+        log("  测试时长 - 单核:" + std::to_string(test_config.duration.single_core) +
+            " 多核:" + std::to_string(test_config.duration.multi_core) +
+            " 内存:" + std::to_string(test_config.duration.memory) +
+            " 加密:" + std::to_string(test_config.duration.crypto) +
+            " GPU:" + std::to_string(test_config.duration.gpu));
+        log("  测试开关 - 单核:" + std::string(test_config.switches.single_core ? "开" : "关") +
+            " 多核:" + std::string(test_config.switches.multi_core ? "开" : "关") +
+            " 内存:" + std::string(test_config.switches.memory ? "开" : "关") +
+            " 加密:" + std::string(test_config.switches.crypto ? "开" : "关") +
+            " GPU:" + std::string(test_config.switches.gpu ? "开" : "关"));
+        log("  权重设置 - 单核:" + std::to_string(test_config.weights.single_core) +
+            " 多核:" + std::to_string(test_config.weights.multi_core) +
+            " 内存:" + std::to_string(test_config.weights.memory) +
+            " 加密:" + std::to_string(test_config.weights.crypto) +
+            " GPU:" + std::to_string(test_config.weights.gpu));
+
+        return true;
+
+    }
+    catch (const std::exception& e) {
+        log("错误：配置文件解析异常: " + std::string(e.what()));
+        file.close();
+        return false;
+    }
+    catch (...) {
+        log("错误：不匹配的格式，请确认文件是否为UTF-8格式、文件扩展名是否匹配或配置文件语法是否正确");
+        file.close();
+        return false;
+    }
+}
+
+bool save_ini_file(const std::string& filepath) {
+    log("尝试保存配置文件到: " + filepath);
+
+    // 检查文件扩展名
+    if (filepath.length() < 4 ||
+        (filepath.substr(filepath.length() - 4) != ".ini" &&
+            filepath.substr(filepath.length() - 4) != ".INI")) {
+        log("错误：文件扩展名不匹配，请使用.ini格式");
+        return false;
+    }
+
+    std::ofstream file(filepath, std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        log("错误：无法创建配置文件，请检查路径和权限");
+        return false;
+    }
+
+    try {
+        // 写入UTF-8 BOM
+        file << char(0xEF) << char(0xBB) << char(0xBF);
+
+        // 写入时间戳
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        std::tm local_time;
+        localtime_s(&local_time, &now_time);
+
+        file << "; Arce TestTool 配置文件" << std::endl;
+        file << "; 生成时间: " << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << std::endl;
+        file << "; 版本: " << test_config.version << std::endl;
+        file << std::endl;
+
+        // 写入测试时长
+        file << "[Durations]" << std::endl;
+        file << "single_core=" << test_config.duration.single_core << std::endl;
+        file << "multi_core=" << test_config.duration.multi_core << std::endl;
+        file << "memory=" << test_config.duration.memory << std::endl;
+        file << "crypto=" << test_config.duration.crypto << std::endl;
+        file << "gpu=" << test_config.duration.gpu << std::endl;
+        file << std::endl;
+
+        // 写入测试开关
+        file << "[Switches]" << std::endl;
+        file << "single_core=" << (test_config.switches.single_core ? 1 : 0) << std::endl;
+        file << "multi_core=" << (test_config.switches.multi_core ? 1 : 0) << std::endl;
+        file << "memory=" << (test_config.switches.memory ? 1 : 0) << std::endl;
+        file << "crypto=" << (test_config.switches.crypto ? 1 : 0) << std::endl;
+        file << "gpu=" << (test_config.switches.gpu ? 1 : 0) << std::endl;
+        file << std::endl;
+
+        // 写入权重设置
+        file << "[Weights]" << std::endl;
+        file << "single_core=" << test_config.weights.single_core << std::endl;
+        file << "multi_core=" << test_config.weights.multi_core << std::endl;
+        file << "memory=" << test_config.weights.memory << std::endl;
+        file << "crypto=" << test_config.weights.crypto << std::endl;
+        file << "gpu=" << test_config.weights.gpu << std::endl;
+        file << std::endl;
+
+        // 写入基准值
+        file << "[Benchmarks]" << std::endl;
+        file << "single_core=" << test_config.benchmarks.single_core << std::endl;
+        file << "multi_core=" << test_config.benchmarks.multi_core << std::endl;
+        file << "memory=" << test_config.benchmarks.memory << std::endl;
+        file << "crypto=" << test_config.benchmarks.crypto << std::endl;
+        file << "gpu=" << test_config.benchmarks.gpu << std::endl;
+        file << std::endl;
+
+        // 写入其他设置
+        file << "[Other]" << std::endl;
+        file << "developer_mode=" << (test_config.developer_mode ? 1 : 0) << std::endl;
+
+        file.close();
+        log("配置文件保存成功: " + filepath);
+        return true;
+
+    }
+    catch (const std::exception& e) {
+        log("错误：保存配置文件时发生异常: " + std::string(e.what()));
+        file.close();
+        return false;
+    }
+    catch (...) {
+        log("错误：保存配置文件时发生未知异常");
+        file.close();
+        return false;
+    }
 }
 
 // 辅助函数：生成随机数
@@ -3149,6 +3394,8 @@ void update_log() {
     log("增加获取系统信息的函数（void get_info）");
     log("1.0.2 CLI更新日志 [更新日期: 2025年12月6日]");
     log("优化获取系统信息的函数（void get_info），区分Windows 10和Windows 11");
+    log("1.0.3 CLI更新日志 [更新日期: 2025年12月20日]");
+    log("新增配置文件导入导出功能，支持加载/保存测试配置");
 }
 
 // 执行所有测试（使用标准化得分计算）
@@ -3326,6 +3573,8 @@ void show_help() {
     log("- ver: 显示软件版本");
     log("- get-info: 获取系统软硬件信息");
     log("- update-log: 查看版本更新日志");
+    log("- load-ini-file-路径: 从指定路径加载配置文件");
+    log("- output-ini-file-路径: 将当前配置导出到指定路径");
     log("- difficult: 说不定有什么隐藏彩蛋或者开发者的诉苦？");
 }
 
@@ -3489,6 +3738,24 @@ void execute_command(const std::string& command) {
             catch (...) {
                 log("错误: 时间必须是整数");
             }
+        }
+    }
+    else if (command.substr(0, 14) == "load-ini-file-") {
+        std::string path = command.substr(14);
+        if (path.empty()) {
+            log("错误: 请指定配置文件的完整路径，格式: load-ini-file-路径");
+        }
+        else {
+            load_ini_file(path);
+        }
+    }
+    else if (command.substr(0, 16) == "output-ini-file-") {
+        std::string path = command.substr(16);
+        if (path.empty()) {
+            log("错误: 请指定配置文件的完整路径，格式: output-ini-file-路径");
+        }
+        else {
+            save_ini_file(path);
         }
     }
     // 测试项目开关设置
