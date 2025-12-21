@@ -83,7 +83,7 @@ struct TestConfig {
     Weights weights;
     Benchmarks benchmarks;  // 基准值
     bool developer_mode = false;
-    const std::string version = "1.0.3 CLI";
+    const std::string version = "1.0.4 CLI";
 };
 
 // 全局配置和状态
@@ -3396,6 +3396,8 @@ void update_log() {
     log("优化获取系统信息的函数（void get_info），区分Windows 10和Windows 11");
     log("1.0.3 CLI更新日志 [更新日期: 2025年12月20日]");
     log("新增配置文件导入导出功能，支持加载/保存测试配置");
+    log("1.0.4 CLI更新日志 [更新日期: 2025年12月21日]");
+    log("新增function和project指令，可以查看主要函数和项目地址");
 }
 
 // 执行所有测试（使用标准化得分计算）
@@ -3575,6 +3577,8 @@ void show_help() {
     log("- update-log: 查看版本更新日志");
     log("- load-ini-file-路径: 从指定路径加载配置文件");
     log("- output-ini-file-路径: 将当前配置导出到指定路径");
+    log("- function: 查看主要函数");
+    log("- project: 查看项目地址");
     log("- difficult: 说不定有什么隐藏彩蛋或者开发者的诉苦？");
 }
 
@@ -3757,6 +3761,24 @@ void execute_command(const std::string& command) {
         else {
             save_ini_file(path);
         }
+    }
+    else if (command == "function") {
+        log("主要函数");
+        log("double random_double");
+        log("void lu_decomposition");
+        log("void svd_decomposition");
+        log("void single_core_test");
+        log("void multi_core_worker");
+        log("void multi_core_test");
+        log("void memory_test");
+        log("void crypto_test");
+        log("void void gpu_test");
+        log("void update_log");
+        log("更多函数，请参阅源码");
+    }
+    else if (command == "project") {
+        log("项目地址");
+        log("GitHub: https://github.com/yimingfeishou/Arce_Tools");
     }
     // 测试项目开关设置
     else if (command == "single_core=true" || command == "single_core=false") {
