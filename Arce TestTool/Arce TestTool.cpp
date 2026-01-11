@@ -40,6 +40,7 @@ struct TestConfig {
         int memory = 12;
         int crypto = 12;
         int gpu = 12;
+        int disk = 12;
     };
 
     Durations duration;
@@ -50,6 +51,7 @@ struct TestConfig {
         bool memory = true;
         bool crypto = true;
         bool gpu = true;
+        bool disk = true;
     };
 
     Switches switches;
@@ -63,6 +65,21 @@ struct TestConfig {
     const int gpu_fluid_size = 256;
     const int gpu_monte_carlo_samples = 1000000;
 
+    struct DiskConfig {
+        const int64_t seq_read_size = 1024 * 1024 * 1024LL;  // 1GB
+        const int64_t seq_write_size = 1024 * 1024 * 1024LL;  // 1GB
+        const int64_t random_read_4k_size = 512 * 1024 * 1024LL;  // 512MB
+        const int64_t random_write_4k_size = 512 * 1024 * 1024LL;  // 512MB
+        const int64_t iops_test_size = 256 * 1024 * 1024LL;  // 256MB
+        const int64_t latency_test_size = 128 * 1024 * 1024LL;  // 128MB
+        const int64_t integrity_test_size = 1024 * 1024 * 1024LL;  // 1GB
+        const int64_t block_size_4k = 4 * 1024;  // 4KB
+        const int64_t block_size_1mb = 1024 * 1024;  // 1MB
+        const int64_t block_size_8k = 8 * 1024;  // 8KB
+    };
+
+    DiskConfig disk_config;
+
     // 评分基准值（用于标准化）
     struct Benchmarks {
         double single_core = 0.005;   // 基准操作数/秒
@@ -70,20 +87,22 @@ struct TestConfig {
         double memory = 1000000.0;
         double crypto = 0.5;
         double gpu = 1.0;
+        double disk = 200.0;
     };
 
     struct Weights {
-        double single_core = 0.25;
-        double multi_core = 0.3;
+        double single_core = 0.2;
+        double multi_core = 0.25;
         double memory = 0.2;
         double crypto = 0.1;
         double gpu = 0.15;
+        double disk = 0.1;
     };
 
     Weights weights;
     Benchmarks benchmarks;  // 基准值
     bool developer_mode = false;
-    const std::string version = "1.0.4 CLI";
+    const std::string version = "1.0.5 CLI";
 };
 
 // 全局配置和状态
@@ -96,6 +115,7 @@ std::map<std::string, double> test_results; // 标准化得分
 std::vector<std::string> log_messages;
 std::recursive_mutex log_mutex;
 std::mutex result_mutex;
+std::map<std::string, std::map<std::string, double>> detailed_disk_results;  // 详细磁盘结果
 
 // 日志功能
 void log(const std::string& message) {
@@ -2950,6 +2970,729 @@ void gpu_test() {
     }
 }
 
+// 磁盘IO测试类
+class DiskIOTester {
+private:
+    std::string test_file_path;
+    std::vector<char> buffer;
+    std::mt19937_64 rng;
+    std::vector<int64_t> random_positions;
+
+public:
+    DiskIOTester() : rng(std::random_device{}()) {
+        // 创建测试文件名
+        char temp_path[MAX_PATH];
+        GetTempPathA(MAX_PATH, temp_path);
+        test_file_path = std::string(temp_path) + "arce_disk_test.tmp";
+
+        // 预分配缓冲区
+        buffer.resize(1024 * 1024);  // 1MB缓冲区
+        for (auto& byte : buffer) {
+            byte = static_cast<char>(rng() & 0xFF);
+        }
+
+        log("磁盘测试文件: " + test_file_path);
+    }
+
+    ~DiskIOTester() {
+        // 清理测试文件
+        cleanup();
+    }
+
+    // 清理测试文件
+    void cleanup() {
+        try {
+            if (std::filesystem::exists(test_file_path)) {
+                std::filesystem::remove(test_file_path);
+                log("已清理测试文件");
+            }
+        }
+        catch (...) {
+            log("清理测试文件时出错");
+        }
+    }
+
+    // 获取磁盘可用空间（MB）
+    double get_free_space_mb() {
+        ULARGE_INTEGER free_bytes, total_bytes, total_free_bytes;
+        if (GetDiskFreeSpaceExA(test_file_path.c_str(), &free_bytes, &total_bytes, &total_free_bytes)) {
+            return static_cast<double>(free_bytes.QuadPart) / (1024.0 * 1024.0);
+        }
+        return 0.0;
+    }
+
+    // 顺序读取测试
+    std::pair<double, double> test_sequential_read(int64_t total_size, int64_t block_size) {
+        log("开始顺序读取测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB, 块大小: " +
+            std::to_string(block_size / 1024) + "KB)");
+
+        std::ofstream file(test_file_path, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            log("错误: 无法创建测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        // 先创建测试数据
+        log("准备测试数据...");
+        int64_t written = 0;
+        auto start_prepare = std::chrono::high_resolution_clock::now();
+
+        while (written < total_size && !stop_test) {
+            int64_t to_write = std::min<int64_t>(buffer.size(), total_size - written);
+            file.write(buffer.data(), to_write);
+            written += to_write;
+        }
+        file.close();
+
+        auto end_prepare = std::chrono::high_resolution_clock::now();
+        double prepare_time = std::chrono::duration<double>(end_prepare - start_prepare).count();
+        log("数据准备完成，耗时: " + std::to_string(prepare_time) + " 秒");
+
+        // 顺序读取测试
+        std::ifstream in_file(test_file_path, std::ios::binary);
+        if (!in_file) {
+            log("错误: 无法打开测试文件进行读取");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> read_buffer(block_size);
+        int64_t total_read = 0;
+        auto start = std::chrono::high_resolution_clock::now();
+
+        while (total_read < total_size && !stop_test) {
+            in_file.read(read_buffer.data(), block_size);
+            int64_t bytes_read = in_file.gcount();
+            if (bytes_read == 0) break;
+
+            total_read += bytes_read;
+
+            // 验证数据（简单校验）
+            if (total_read % (100 * 1024 * 1024) == 0) {
+                log("已读取: " + std::to_string(total_read / (1024 * 1024)) + "MB");
+            }
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        in_file.close();
+
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double speed_mbs = (total_read > 0 && elapsed > 0) ?
+            (total_read / (1024.0 * 1024.0) / elapsed) : 0.0;
+
+        log("顺序读取完成: " + std::to_string(speed_mbs) + " MB/s, 时间: " +
+            std::to_string(elapsed) + " 秒");
+
+        return { speed_mbs, elapsed };
+    }
+
+    // 顺序写入测试
+    std::pair<double, double> test_sequential_write(int64_t total_size, int64_t block_size) {
+        log("开始顺序写入测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB, 块大小: " +
+            std::to_string(block_size / 1024) + "KB)");
+
+        std::ofstream file(test_file_path, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            log("错误: 无法创建测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> write_buffer(block_size);
+        for (auto& byte : write_buffer) {
+            byte = static_cast<char>(rng() & 0xFF);
+        }
+
+        int64_t total_written = 0;
+        auto start = std::chrono::high_resolution_clock::now();
+
+        while (total_written < total_size && !stop_test) {
+            file.write(write_buffer.data(), block_size);
+            total_written += block_size;
+
+            if (total_written % (100 * 1024 * 1024) == 0) {
+                log("已写入: " + std::to_string(total_written / (1024 * 1024)) + "MB");
+            }
+        }
+
+        file.flush();
+        auto end = std::chrono::high_resolution_clock::now();
+        file.close();
+
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double speed_mbs = (total_written > 0 && elapsed > 0) ?
+            (total_written / (1024.0 * 1024.0) / elapsed) : 0.0;
+
+        log("顺序写入完成: " + std::to_string(speed_mbs) + " MB/s, 时间: " +
+            std::to_string(elapsed) + " 秒");
+
+        return { speed_mbs, elapsed };
+    }
+
+    // 随机读取测试
+    std::pair<double, double> test_random_read_4k(int64_t total_size) {
+        log("开始4K随机读取测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB)");
+
+        // 准备随机访问位置
+        int64_t file_size = total_size;
+        int64_t num_blocks = file_size / 4096;
+
+        if (random_positions.empty()) {
+            random_positions.resize(num_blocks);
+            std::iota(random_positions.begin(), random_positions.end(), 0);
+            std::shuffle(random_positions.begin(), random_positions.end(), rng);
+        }
+
+        std::ifstream file(test_file_path, std::ios::binary);
+        if (!file) {
+            log("错误: 无法打开测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> read_buffer(4096);
+        int64_t operations = 0;
+        int64_t total_read = 0;
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (int64_t i = 0; i < num_blocks && total_read < total_size && !stop_test; i++) {
+            int64_t block_idx = random_positions[i];
+            int64_t position = block_idx * 4096;
+
+            file.seekg(position, std::ios::beg);
+            file.read(read_buffer.data(), 4096);
+
+            if (!file) break;
+
+            operations++;
+            total_read += 4096;
+
+            if (operations % 10000 == 0) {
+                log("随机读取操作: " + std::to_string(operations));
+            }
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        file.close();
+
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double iops = (operations > 0 && elapsed > 0) ? (operations / elapsed) : 0.0;
+
+        log("4K随机读取完成: " + std::to_string(iops) + " IOPS, 时间: " +
+            std::to_string(elapsed) + " 秒");
+
+        return { iops, elapsed };
+    }
+
+    // 随机写入测试
+    std::pair<double, double> test_random_write_4k(int64_t total_size) {
+        log("开始4K随机写入测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB)");
+
+        // 确保文件足够大
+        {
+            std::ofstream file(test_file_path, std::ios::binary | std::ios::app);
+            file.seekp(total_size - 1, std::ios::beg);
+            file.write("", 1);
+        }
+
+        std::fstream file(test_file_path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!file) {
+            log("错误: 无法打开测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> write_buffer(4096);
+        for (auto& byte : write_buffer) {
+            byte = static_cast<char>(rng() & 0xFF);
+        }
+
+        int64_t num_blocks = total_size / 4096;
+        if (random_positions.empty()) {
+            random_positions.resize(num_blocks);
+            std::iota(random_positions.begin(), random_positions.end(), 0);
+            std::shuffle(random_positions.begin(), random_positions.end(), rng);
+        }
+
+        int64_t operations = 0;
+        int64_t total_written = 0;
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (int64_t i = 0; i < num_blocks && total_written < total_size && !stop_test; i++) {
+            int64_t block_idx = random_positions[i];
+            int64_t position = block_idx * 4096;
+
+            file.seekp(position, std::ios::beg);
+            file.write(write_buffer.data(), 4096);
+
+            if (!file) break;
+
+            operations++;
+            total_written += 4096;
+
+            if (operations % 10000 == 0) {
+                log("随机写入操作: " + std::to_string(operations));
+            }
+        }
+
+        file.flush();
+        auto end = std::chrono::high_resolution_clock::now();
+        file.close();
+
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double iops = (operations > 0 && elapsed > 0) ? (operations / elapsed) : 0.0;
+
+        log("4K随机写入完成: " + std::to_string(iops) + " IOPS, 时间: " +
+            std::to_string(elapsed) + " 秒");
+
+        return { iops, elapsed };
+    }
+
+    // IOPS测试（混合读写）
+    std::pair<double, double> test_iops(int64_t total_size) {
+        log("开始IOPS测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB)");
+
+        // 准备文件
+        {
+            std::ofstream file(test_file_path, std::ios::binary | std::ios::trunc);
+            file.seekp(total_size - 1, std::ios::beg);
+            file.write("", 1);
+        }
+
+        std::fstream file(test_file_path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!file) {
+            log("错误: 无法打开测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> buffer(8192);  // 8KB块
+        for (auto& byte : buffer) {
+            byte = static_cast<char>(rng() & 0xFF);
+        }
+
+        std::vector<char> read_buffer(8192);
+        int64_t num_blocks = total_size / 8192;
+
+        int64_t operations = 0;
+        int64_t total_processed = 0;
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (int64_t i = 0; i < num_blocks && total_processed < total_size && !stop_test; i++) {
+            // 随机选择读或写
+            bool is_write = (rng() % 4 == 0);  // 25%写入，75%读取
+
+            int64_t position = (rng() % num_blocks) * 8192;
+
+            if (is_write) {
+                // 写入操作
+                file.seekp(position, std::ios::beg);
+                file.write(buffer.data(), 8192);
+                if (!file) continue;
+            }
+            else {
+                // 读取操作
+                file.seekg(position, std::ios::beg);
+                file.read(read_buffer.data(), 8192);
+                if (!file) continue;
+            }
+
+            operations++;
+            total_processed += 8192;
+
+            if (operations % 5000 == 0) {
+                log("IOPS测试操作: " + std::to_string(operations));
+            }
+        }
+
+        file.flush();
+        auto end = std::chrono::high_resolution_clock::now();
+        file.close();
+
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double iops = (operations > 0 && elapsed > 0) ? (operations / elapsed) : 0.0;
+
+        log("IOPS测试完成: " + std::to_string(iops) + " IOPS, 时间: " +
+            std::to_string(elapsed) + " 秒");
+
+        return { iops, elapsed };
+    }
+
+    // 访问延迟测试
+    std::pair<double, double> test_access_latency(int64_t total_size) {
+        log("开始访问延迟测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB)");
+
+        std::ifstream file(test_file_path, std::ios::binary);
+        if (!file) {
+            log("错误: 无法打开测试文件");
+            return { 0.0, 0.0 };
+        }
+
+        std::vector<char> read_buffer(512);  // 小数据块测试延迟
+        int64_t num_positions = total_size / 512;
+
+        std::vector<int64_t> positions(num_positions);
+        std::iota(positions.begin(), positions.end(), 0);
+        std::shuffle(positions.begin(), positions.end(), rng);
+
+        int64_t samples = std::min<int64_t>(10000, num_positions);  // 采样10000次
+        std::vector<double> latencies;
+        latencies.reserve(samples);
+
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        for (int64_t i = 0; i < samples && !stop_test; i++) {
+            int64_t position = positions[i] * 512;
+
+            auto start_op = std::chrono::high_resolution_clock::now();
+
+            file.seekg(position, std::ios::beg);
+            file.read(read_buffer.data(), 512);
+
+            auto end_op = std::chrono::high_resolution_clock::now();
+
+            if (!file) {
+                file.clear();
+                continue;
+            }
+
+            double latency_us = std::chrono::duration<double, std::micro>(end_op - start_op).count();
+            latencies.push_back(latency_us);
+
+            if (i % 1000 == 0) {
+                log("延迟测试采样: " + std::to_string(i) + "/" + std::to_string(samples));
+            }
+        }
+
+        auto total_end = std::chrono::high_resolution_clock::now();
+        file.close();
+
+        if (latencies.empty()) {
+            log("延迟测试失败: 无有效数据");
+            return { 0.0, 0.0 };
+        }
+
+        // 计算统计信息
+        double sum = std::accumulate(latencies.begin(), latencies.end(), 0.0);
+        double avg_latency = sum / latencies.size();
+
+        double sq_sum = std::inner_product(latencies.begin(), latencies.end(), latencies.begin(), 0.0);
+        double stddev = std::sqrt(sq_sum / latencies.size() - avg_latency * avg_latency);
+
+        std::sort(latencies.begin(), latencies.end());
+        double p95 = latencies[latencies.size() * 0.95];
+        double p99 = latencies[latencies.size() * 0.99];
+
+        log("延迟统计 (微秒):");
+        log("  平均: " + std::to_string(avg_latency));
+        log("  标准差: " + std::to_string(stddev));
+        log("  P95: " + std::to_string(p95));
+        log("  P99: " + std::to_string(p99));
+
+        double elapsed = std::chrono::duration<double>(total_end - total_start).count();
+
+        log("访问延迟测试完成, 时间: " + std::to_string(elapsed) + " 秒");
+
+        return { avg_latency, elapsed };
+    }
+
+    // 数据完整性测试
+    std::pair<bool, double> test_data_integrity(int64_t total_size) {
+        log("开始数据完整性测试 (大小: " + std::to_string(total_size / (1024 * 1024)) + "MB)");
+
+        // 生成测试模式
+        std::vector<char> pattern(1024 * 1024);  // 1MB模式
+        for (size_t i = 0; i < pattern.size(); i++) {
+            pattern[i] = static_cast<char>((i * 13 + 7) & 0xFF);
+        }
+
+        // 写入模式数据
+        log("写入模式数据...");
+        std::ofstream out_file(test_file_path, std::ios::binary | std::ios::trunc);
+        if (!out_file) {
+            log("错误: 无法创建测试文件");
+            return { false, 0.0 };
+        }
+
+        auto write_start = std::chrono::high_resolution_clock::now();
+
+        int64_t written = 0;
+        while (written < total_size && !stop_test) {
+            int64_t to_write = std::min<int64_t>(pattern.size(), total_size - written);
+            out_file.write(pattern.data(), to_write);
+            written += to_write;
+        }
+        out_file.close();
+
+        auto write_end = std::chrono::high_resolution_clock::now();
+        double write_time = std::chrono::duration<double>(write_end - write_start).count();
+
+        // 读取并验证
+        log("读取并验证数据完整性...");
+        std::ifstream in_file(test_file_path, std::ios::binary);
+        if (!in_file) {
+            log("错误: 无法打开测试文件");
+            return { false, 0.0 };
+        }
+
+        std::vector<char> read_buffer(1024 * 1024);
+        int64_t read = 0;
+        int64_t errors = 0;
+
+        auto read_start = std::chrono::high_resolution_clock::now();
+
+        while (read < total_size && !stop_test) {
+            int64_t to_read = std::min<int64_t>(read_buffer.size(), total_size - read);
+            in_file.read(read_buffer.data(), to_read);
+            int64_t bytes_read = in_file.gcount();
+
+            if (bytes_read != to_read) {
+                log("错误: 读取数据不完整");
+                errors++;
+                break;
+            }
+
+            // 验证数据
+            for (int64_t i = 0; i < bytes_read; i++) {
+                char expected = static_cast<char>(((read + i) * 13 + 7) & 0xFF);
+                if (read_buffer[i] != expected) {
+                    errors++;
+                    if (errors <= 10) {
+                        log("数据不匹配在位置 " + std::to_string(read + i) +
+                            ": 期望 " + std::to_string((int)expected) +
+                            ", 实际 " + std::to_string((int)read_buffer[i]));
+                    }
+                }
+            }
+
+            read += bytes_read;
+
+            if (read % (100 * 1024 * 1024) == 0) {
+                log("已验证: " + std::to_string(read / (1024 * 1024)) + "MB");
+            }
+        }
+
+        in_file.close();
+        auto read_end = std::chrono::high_resolution_clock::now();
+        double read_time = std::chrono::duration<double>(read_end - read_start).count();
+
+        bool integrity_ok = (errors == 0);
+
+        if (integrity_ok) {
+            log("数据完整性测试通过");
+        }
+        else {
+            log("数据完整性测试失败，发现 " + std::to_string(errors) + " 个错误");
+        }
+
+        double total_time = write_time + read_time;
+        log("数据完整性测试完成, 总时间: " + std::to_string(total_time) + " 秒");
+
+        return { integrity_ok, total_time };
+    }
+};
+
+// 磁盘IO测试辅助函数
+void IO_test(DiskIOTester& tester, std::map<std::string, std::map<std::string, double>>& results) {
+    log("\n===== 磁盘IO子测试开始 =====");
+
+    // 检查磁盘空间
+    double free_space_mb = tester.get_free_space_mb();
+    log("磁盘可用空间: " + std::to_string(free_space_mb) + " MB");
+
+    if (free_space_mb < 5000) {  // 小于5GB
+        log("警告: 磁盘可用空间可能不足，建议释放空间");
+    }
+
+    // 1. 顺序读取测试
+    log("\n[1/7] 顺序读取测试");
+    auto seq_read = tester.test_sequential_read(
+        test_config.disk_config.seq_read_size,
+        test_config.disk_config.block_size_1mb
+    );
+    results["sequential_read"]["speed_mbs"] = seq_read.first;
+    results["sequential_read"]["time_sec"] = seq_read.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 2. 顺序写入测试
+    log("\n[2/7] 顺序写入测试");
+    auto seq_write = tester.test_sequential_write(
+        test_config.disk_config.seq_write_size,
+        test_config.disk_config.block_size_1mb
+    );
+    results["sequential_write"]["speed_mbs"] = seq_write.first;
+    results["sequential_write"]["time_sec"] = seq_write.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 3. 4K随机读取测试
+    log("\n[3/7] 4K随机读取测试");
+    auto rand_read = tester.test_random_read_4k(test_config.disk_config.random_read_4k_size);
+    results["random_read_4k"]["iops"] = rand_read.first;
+    results["random_read_4k"]["time_sec"] = rand_read.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 4. 4K随机写入测试
+    log("\n[4/7] 4K随机写入测试");
+    auto rand_write = tester.test_random_write_4k(test_config.disk_config.random_write_4k_size);
+    results["random_write_4k"]["iops"] = rand_write.first;
+    results["random_write_4k"]["time_sec"] = rand_write.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 5. IOPS测试
+    log("\n[5/7] IOPS测试");
+    auto iops_test = tester.test_iops(test_config.disk_config.iops_test_size);
+    results["iops"]["value"] = iops_test.first;
+    results["iops"]["time_sec"] = iops_test.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 6. 访问延迟测试
+    log("\n[6/7] 访问延迟测试");
+    auto latency_test = tester.test_access_latency(test_config.disk_config.latency_test_size);
+    results["latency"]["avg_us"] = latency_test.first;
+    results["latency"]["time_sec"] = latency_test.second;
+
+    // 短暂暂停
+    if (!stop_test) std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // 7. 数据完整性测试
+    log("\n[7/7] 数据完整性测试");
+    auto integrity_test = tester.test_data_integrity(test_config.disk_config.integrity_test_size);
+    results["integrity"]["passed"] = integrity_test.first ? 1.0 : 0.0;
+    results["integrity"]["time_sec"] = integrity_test.second;
+
+    log("===== 磁盘IO子测试完成 =====");
+}
+
+// 磁盘测试主函数
+void disk_test() {
+    log("开始磁盘性能测试，持续约 " + std::to_string(test_config.duration.disk) + " 秒");
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto end_time = start_time + std::chrono::seconds(test_config.duration.disk);
+
+    try {
+        DiskIOTester tester;
+
+        // 执行所有IO测试
+        std::map<std::string, std::map<std::string, double>> detailed_results;
+        IO_test(tester, detailed_results);
+
+        // 计算综合得分
+        if (!stop_test) {
+            double total_raw_score = 0.0;
+            double weight_sum = 0.0;
+
+            // 顺序读取权重
+            if (detailed_results["sequential_read"]["speed_mbs"] > 0) {
+                double speed = detailed_results["sequential_read"]["speed_mbs"];
+                total_raw_score += speed * 0.25;
+                weight_sum += 0.25;
+                log("顺序读取: " + std::to_string(speed) + " MB/s");
+            }
+
+            // 顺序写入权重
+            if (detailed_results["sequential_write"]["speed_mbs"] > 0) {
+                double speed = detailed_results["sequential_write"]["speed_mbs"];
+                total_raw_score += speed * 0.25;
+                weight_sum += 0.25;
+                log("顺序写入: " + std::to_string(speed) + " MB/s");
+            }
+
+            // 随机读取权重（转换为等效MB/s）
+            if (detailed_results["random_read_4k"]["iops"] > 0) {
+                double iops = detailed_results["random_read_4k"]["iops"];
+                double speed = iops * 4.0 / 1024.0;  // IOPS * 4KB 转换为 MB/s
+                total_raw_score += speed * 0.15;
+                weight_sum += 0.15;
+                log("4K随机读取: " + std::to_string(iops) + " IOPS");
+            }
+
+            // 随机写入权重
+            if (detailed_results["random_write_4k"]["iops"] > 0) {
+                double iops = detailed_results["random_write_4k"]["iops"];
+                double speed = iops * 4.0 / 1024.0;  // IOPS * 4KB 转换为 MB/s
+                total_raw_score += speed * 0.15;
+                weight_sum += 0.15;
+                log("4K随机写入: " + std::to_string(iops) + " IOPS");
+            }
+
+            // IOPS权重
+            if (detailed_results["iops"]["value"] > 0) {
+                double iops = detailed_results["iops"]["value"];
+                total_raw_score += iops / 1000.0 * 0.1;  // 每1000 IOPS得1分
+                weight_sum += 0.1;
+                log("混合IOPS: " + std::to_string(iops) + " IOPS");
+            }
+
+            // 延迟权重（低延迟得高分）
+            if (detailed_results["latency"]["avg_us"] > 0) {
+                double latency = detailed_results["latency"]["avg_us"];
+                double latency_score = 100.0 / std::max(1.0, latency / 100.0);  // 每100us得100分
+                total_raw_score += latency_score * 0.05;
+                weight_sum += 0.05;
+                log("平均延迟: " + std::to_string(latency) + " 微秒");
+            }
+
+            // 完整性权重
+            if (detailed_results["integrity"]["passed"] > 0) {
+                total_raw_score += 100.0 * 0.05;  // 通过得100分
+                weight_sum += 0.05;
+                log("数据完整性: 通过");
+            }
+            else {
+                log("数据完整性: 失败");
+            }
+
+            double raw_score = (weight_sum > 0) ? total_raw_score / weight_sum : 0.0;
+
+            // 标准化得分
+            double normalized = (raw_score / test_config.benchmarks.disk) * 100;
+            normalized = std::max(0.0, normalized);
+
+            // 存储结果
+            std::lock_guard<std::mutex> lock(result_mutex);
+            raw_results["disk"] = raw_score;
+            test_results["disk"] = normalized;
+            detailed_disk_results = detailed_results;
+
+            log("\n磁盘性能测试完成");
+            log("原始得分: " + std::to_string(raw_score));
+            log("标准化得分: " + std::to_string(normalized));
+
+            // 输出详细结果
+            log("\n===== 详细磁盘测试结果 =====");
+            for (const auto& [test_name, metrics] : detailed_results) {
+                log(test_name + ":");
+                for (const auto& [metric, value] : metrics) {
+                    log("  " + metric + ": " + std::to_string(value));
+                }
+            }
+            log("==============================");
+        }
+        else {
+            log("磁盘测试被中止");
+        }
+
+        // 清理测试文件
+        tester.cleanup();
+
+    }
+    catch (const std::exception& e) {
+        log("磁盘测试异常: " + std::string(e.what()));
+    }
+    catch (...) {
+        log("磁盘测试未知异常");
+    }
+}
+
 // 获取系统软硬件信息
 void get_info() {
     log("开始获取系统软硬件信息...");
@@ -3382,12 +4125,6 @@ void get_info() {
     }
 }
 
-void gpu_test_it_s_too_difficult() {
-    log("GPU实现太难了，虽然我们也在尽力优化，但是结果还是不准确");
-    log("我觉得我们还是关闭GPU测试吧？");
-    log("为什么微软不在更新Windows 11的时候同步更新API啊，搞得现在获取ProductName都不准确");
-}
-
 void update_log() {
     log("1.0.1 CLI更新日志 [更新日期: 2025年12月4日]");
     log("优化GPU测试，使带宽获取更准确，测试时间更短（相对）");
@@ -3398,6 +4135,8 @@ void update_log() {
     log("新增配置文件导入导出功能，支持加载/保存测试配置");
     log("1.0.4 CLI更新日志 [更新日期: 2025年12月21日]");
     log("新增function和project指令，可以查看主要函数和项目地址");
+    log("1.0.5 CLI更新日志 [更新日期: 2025年12月25日]");
+    log("新增磁盘性能测试功能，包括顺序读写、随机读写、IOPS、延迟和数据完整性测试");
 }
 
 // 执行所有测试（使用标准化得分计算）
@@ -3470,6 +4209,17 @@ void run_all_tests() {
         log("跳过GPGPU性能测试（已关闭）");
     }
 
+    if (test_config.switches.disk) {
+        disk_test();
+        if (stop_test) {
+            is_testing = false;
+            return;
+        }
+    }
+    else {
+        log("跳过磁盘性能测试（已关闭）");
+    }
+
     // 计算总分时只计算已开启的测试项目
     if (!test_results.empty()) {
         double total_score = 0.0;
@@ -3495,6 +4245,10 @@ void run_all_tests() {
             total_score += test_results["gpu"] * test_config.weights.gpu;
             total_weight += test_config.weights.gpu;
         }
+        if (test_config.switches.disk && test_results.count("disk")) {
+            total_score += test_results["disk"] * test_config.weights.disk;
+            total_weight += test_config.weights.disk;
+        }
 
         // 如果所有测试都关闭，则total_weight为0，需要避免除以0
         if (total_weight > 0) {
@@ -3502,7 +4256,8 @@ void run_all_tests() {
                 test_config.weights.multi_core +
                 test_config.weights.memory +
                 test_config.weights.crypto +
-                test_config.weights.gpu);
+                test_config.weights.gpu +
+                test_config.weights.disk);
         }
         else {
             total_score = 0.0;
@@ -3577,9 +4332,8 @@ void show_help() {
     log("- update-log: 查看版本更新日志");
     log("- load-ini-file-路径: 从指定路径加载配置文件");
     log("- output-ini-file-路径: 将当前配置导出到指定路径");
-    log("- function: 查看主要函数");
+    log("- disk-details: 查看磁盘测试详细结果");
     log("- project: 查看项目地址");
-    log("- difficult: 说不定有什么隐藏彩蛋或者开发者的诉苦？");
 }
 
 // 列出所有测试项
@@ -3595,6 +4349,8 @@ void list_tests() {
         "秒, 状态: " + (test_config.switches.crypto ? "开启" : "关闭") + ")");
     log("- gpu: GPGPU性能测试 (时长: " + std::to_string(test_config.duration.gpu) +
         "秒, 状态: " + (test_config.switches.gpu ? "开启" : "关闭") + ")");
+    log("- disk: 磁盘性能测试 (时长: " + std::to_string(test_config.duration.disk) +
+        "秒, 状态: " + (test_config.switches.disk ? "开启" : "关闭") + ")");
 }
 
 // 设置测试时间
@@ -3624,6 +4380,10 @@ void set_test_time(const std::string& test_item, int duration) {
         test_config.duration.gpu = duration;
         log("GPGPU性能测试时长已设置为 " + std::to_string(duration) + " 秒");
     }
+    else if (test_item == "disk") {
+        test_config.duration.disk = duration;
+        log("磁盘性能测试时长已设置为 " + std::to_string(duration) + " 秒");
+    }
     else {
         log("错误: 测试项 '" + test_item + "' 不存在");
     }
@@ -3645,6 +4405,9 @@ void show_test_time(const std::string& test_item) {
     }
     else if (test_item == "gpu") {
         log("GPGPU性能测试当前时长: " + std::to_string(test_config.duration.gpu) + " 秒");
+    }
+    else if (test_item == "disk") {
+        log("磁盘性能测试当前时长: " + std::to_string(test_config.duration.disk) + " 秒");
     }
     else {
         log("错误: 测试项 '" + test_item + "' 不存在");
@@ -3717,9 +4480,6 @@ void execute_command(const std::string& command) {
     else if (command == "update-log") {
         update_log();
     }
-    else if (command == "difficult") {
-        gpu_test_it_s_too_difficult();
-    }
     else if (command.substr(0, 10) == "test-time-") {
         std::string sub = command.substr(10);
         size_t pos = sub.find('-');
@@ -3762,20 +4522,6 @@ void execute_command(const std::string& command) {
             save_ini_file(path);
         }
     }
-    else if (command == "function") {
-        log("主要函数");
-        log("double random_double");
-        log("void lu_decomposition");
-        log("void svd_decomposition");
-        log("void single_core_test");
-        log("void multi_core_worker");
-        log("void multi_core_test");
-        log("void memory_test");
-        log("void crypto_test");
-        log("void void gpu_test");
-        log("void update_log");
-        log("更多函数，请参阅源码");
-    }
     else if (command == "project") {
         log("项目地址");
         log("GitHub: https://github.com/yimingfeishou/Arce_Tools");
@@ -3806,6 +4552,26 @@ void execute_command(const std::string& command) {
         test_config.switches.gpu = value;
         log("GPGPU性能测试: " + std::string(value ? "开启" : "关闭"));
     }
+    else if (command == "disk=true" || command == "disk=false") {
+        bool value = (command == "disk=true");
+        test_config.switches.disk = value;
+        log("磁盘性能测试: " + std::string(value ? "开启" : "关闭"));
+        }
+    else if (command == "disk-details") {
+            if (detailed_disk_results.empty()) {
+                log("暂无磁盘测试详细结果");
+            }
+            else {
+                log("\n===== 磁盘测试详细结果 =====");
+                for (const auto& [test_name, metrics] : detailed_disk_results) {
+                    log(test_name + ":");
+                    for (const auto& [metric, value] : metrics) {
+                        log("  " + metric + ": " + std::to_string(value));
+                    }
+                }
+                log("==============================");
+            }
+            }
     else if (command == "dev-test") {
         toggle_developer_mode();
     }
@@ -3828,6 +4594,8 @@ int main() {
     log("测试时仍可以输入命令进行操作");
     log("如要获得最准确的测试结果，建议以管理员身份运行");
     log("L1/L2为获取单个核心的缓存，L3为获取整个CPU的缓存，可能会与任务管理器显示的缓存有差异");
+    log("磁盘测试会创建临时文件，测试后会自动清理，请确保有足够磁盘空间");
+    log("磁盘测试可能会花费较长时间，测试期间请勿操作测试文件");
     log("测试结果仅供参考，请以实际性能为准");
     log("GPU测试时间可能较长（屎山代码发力了），将在后续更新时解决（现在没解决），敬请谅解，可以关闭此测试项，指令详见 'help'");
     log("在 " + username + " 用户上");
